@@ -23,6 +23,7 @@ from constraint_baseline import (
     render_constraint_instruction,
     require_tokenizer_compatibility,
     sha256_value,
+    terminal_eos_length_contract,
     validate_compiled_constraint_artifact,
 )
 from run_baseline_llm import (
@@ -81,7 +82,7 @@ def compiled_artifact(
     separator: int = 9,
     rule: str | None = None,
     n_low: int = 2,
-    n: int = 64,
+    n: int = 65,
 ) -> Dict[str, Any]:
     primitive_ids = list(
         dict.fromkeys(token for pattern in patterns for token in pattern)
@@ -119,6 +120,7 @@ def compiled_artifact(
         "stop_symbol_id": stop_symbol,
         "n_low": n_low,
         "n": n,
+        "length_contract": terminal_eos_length_contract(n_low, n),
         "prompt_token_ids": [10, 20],
         "tokenizer_fingerprint": tokenizer_fingerprint(),
         "instruction": {
@@ -157,7 +159,8 @@ def row(
         "n_low": artifact["n_low"],
         "n": artifact["n"],
         "seed": 1,
-        "prompt_text": "",
+        "prompt_text": "Write exactly one short sentence.",
+        "task_prompt_text": "Write exactly one short sentence.",
         "prompt_token_ids": list(artifact["prompt_token_ids"]),
         "separator_text": " and",
         "separator_token_id": separator,
@@ -172,10 +175,14 @@ def row(
 
 
 def workload(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    n_low = rows[0]["n_low"]
+    n = rows[0]["n"]
     return {
         "schema_version": COMPILED_WORKLOAD_SCHEMA_VERSION,
         "kind": COMPILED_WORKLOAD_KIND,
         "dataset": "test",
+        "length_interval_including_eos": [n_low, n],
+        "length_contract": terminal_eos_length_contract(n_low, n),
         "family_counts": {
             family: sum(item["constraint"] == family for item in rows)
             for family in family_order(rows)
@@ -264,12 +271,26 @@ def test_instruction_rule_is_consumed_from_artifact() -> None:
     rule = "Use the exact rule supplied by the workload, including Ω."
     example = row("unrecognized_family_name", rule=rule)
     example["prompt_text"] = "Continue this exact source once."
+    example["task_prompt_text"] = example["prompt_text"]
     instruction = render_constraint_instruction(example)
     content = compose_user_content(example)
     assert rule in instruction
-    assert "1 and 63 content model tokens" in instruction
+    assert "1 and 64 content model tokens" in instruction
     assert content.count(example["prompt_text"]) == 1
     assert content.count("Output constraint:") == 1
+    assert "Return only the requested generated text" not in content
+
+
+def test_prompt_composition_requires_authenticated_task_prompt() -> None:
+    example = row()
+    example.pop("task_prompt_text")
+    with pytest.raises(ValueError, match="task_prompt_text"):
+        compose_user_content(example)
+
+    example = row()
+    example["prompt_text"] = "A different prompt."
+    with pytest.raises(ValueError, match="must equal"):
+        compose_user_content(example)
 
 
 def test_separator_rule_is_clarified_from_verified_runtime_tokenizer() -> None:
@@ -397,7 +418,7 @@ def test_compiled_artifact_rejects_empty_tokenizer_file_fingerprint() -> None:
         validate_compiled_constraint_artifact(artifact)
 
 
-def test_schema_v3_workload_hash_and_dynamic_family_order(
+def test_schema_v4_workload_hash_and_dynamic_family_order(
     tmp_path: Path,
 ) -> None:
     rows = []
@@ -414,7 +435,8 @@ def test_schema_v3_workload_hash_and_dynamic_family_order(
 
     loaded = load_workload(path, expected_dataset="test")
     assert loaded["_family_order"] == ["family_beta", "family_alpha"]
-    selected = select_jobs(loaded["jobs"], "midpoint_per_family", [])
+    assert loaded["_execution_jobs"] == loaded["jobs"]
+    selected = select_jobs(loaded["_execution_jobs"], "midpoint_per_family", [])
     assert [item["constraint"] for item in selected] == [
         "family_beta",
         "family_alpha",
@@ -427,17 +449,62 @@ def test_schema_v3_workload_hash_and_dynamic_family_order(
         load_workload(path, expected_dataset="test")
 
 
+def test_authenticated_execution_selection_limits_baseline_jobs(
+    tmp_path: Path,
+) -> None:
+    rows = []
+    for index in range(4):
+        item = row("family_alpha")
+        item["job_id"] = f"{index:03d}_family_alpha"
+        item["design_index"] = index
+        item["replicate_index"] = index % 2
+        rows.append(item)
+    payload = workload(rows)
+    selected = [rows[0], rows[2]]
+    selected_ids = [item["job_id"] for item in selected]
+    selection = {
+        "schema_version": 1,
+        "selection_order": "canonical_workload_order",
+        "operation_order": ["replicate_filter", "max_jobs_prefix"],
+        "replicate_indices": [0],
+        "max_jobs": None,
+        "source_instances": 4,
+        "instances_after_replicate_filter": 2,
+        "selected_instances": 2,
+        "selected_family_counts": {"family_alpha": 2},
+        "selected_job_ids": selected_ids,
+        "selected_job_ids_sha256": sha256_value(selected_ids),
+    }
+    payload["execution_selection"] = {
+        **selection,
+        "sha256": sha256_value(selection),
+    }
+    path = tmp_path / "selected.json"
+    write_workload(path, payload)
+
+    loaded = load_workload(path)
+    assert [item["job_id"] for item in loaded["_execution_jobs"]] == selected_ids
+
+    payload["execution_selection"]["selected_instances"] = 4
+    selection_body = dict(payload["execution_selection"])
+    selection_body.pop("sha256")
+    payload["execution_selection"]["sha256"] = sha256_value(selection_body)
+    write_workload(path, payload)
+    with pytest.raises(ValueError, match="differs from its jobs"):
+        load_workload(path)
+
+
 def test_legacy_or_missing_compiled_workload_fails_clearly(
     tmp_path: Path,
 ) -> None:
     payload = workload([row()])
-    payload["schema_version"] = 2
+    payload["schema_version"] = 3
     path = tmp_path / "legacy.json"
     write_workload(path, payload)
-    with pytest.raises(ValueError, match="schema_version 3"):
+    with pytest.raises(ValueError, match="schema_version 4"):
         load_workload(path)
 
-    payload["schema_version"] = 3
+    payload["schema_version"] = 4
     payload["jobs"][0].pop("compiled_constraint")
     payload["jobs_sha256"] = sha256_value(payload["jobs"])
     write_workload(path, payload)

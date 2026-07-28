@@ -1377,7 +1377,7 @@ def main() -> None:
     for dataset in dataset_names:
         source_selected.extend(
             select_jobs(
-                workloads[dataset]["jobs"],
+                workloads[dataset]["_execution_jobs"],
                 args.selection,
                 indices,
             )
@@ -1464,7 +1464,7 @@ def main() -> None:
                     }
                 )
             ],
-            "constraint_evaluator": "compiled_token_partition_nfa_schema_v1",
+            "constraint_evaluator": "compiled_token_partition_nfa_schema_v2",
             "authoritative_scorer": str(ROOT / "constraint_baseline.py"),
         },
         "workloads": {

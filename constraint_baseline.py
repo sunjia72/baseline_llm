@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
 
-COMPILED_WORKLOAD_SCHEMA_VERSION = 3
+COMPILED_WORKLOAD_SCHEMA_VERSION = 4
 COMPILED_WORKLOAD_KIND = "compiled_keyword_dataset"
-COMPILED_CONSTRAINT_SCHEMA_VERSION = 1
+COMPILED_CONSTRAINT_SCHEMA_VERSION = 2
 COMPILED_CONSTRAINT_KIND = "compiled_token_partition_nfa"
+LENGTH_CONTRACT_SCHEMA_VERSION = 1
+EXECUTION_SELECTION_SCHEMA_VERSION = 1
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -57,6 +59,86 @@ def _integer_list(
     if nonnegative and any(item < 0 for item in result):
         raise ValueError(f"{name} must contain nonnegative integers")
     return result
+
+
+def terminal_eos_length_contract(n_low: int, n: int) -> Dict[str, Any]:
+    """Return the method-neutral content/terminal length contract."""
+
+    if not 1 <= n_low <= n:
+        raise ValueError("compiled constraint length bounds are invalid")
+    return {
+        "schema_version": LENGTH_CONTRACT_SCHEMA_VERSION,
+        "content_token_interval": [n_low - 1, n - 1],
+        "total_token_interval_including_eos": [n_low, n],
+        "terminal_eos_tokens": 1,
+        "eos_counts_toward_total": True,
+        "eos_counts_toward_content": False,
+    }
+
+
+def _execution_rows(
+    workload: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+) -> List[Mapping[str, Any]]:
+    """Authenticate and apply an optional run-specific workload selection."""
+
+    selection = workload.get("execution_selection")
+    if selection is None:
+        return list(jobs)
+    if not isinstance(selection, Mapping):
+        raise ValueError("workload execution_selection must be an object")
+    body = dict(selection)
+    digest = body.pop("sha256", None)
+    if digest != sha256_value(body):
+        raise ValueError("workload execution_selection digest mismatch")
+    replicate_indices = body.get("replicate_indices")
+    if replicate_indices is not None:
+        replicate_indices = _integer_list(
+            replicate_indices,
+            "execution_selection replicate_indices",
+            nonempty=True,
+            nonnegative=True,
+        )
+        if len(replicate_indices) != len(set(replicate_indices)):
+            raise ValueError(
+                "execution_selection replicate_indices must be distinct"
+            )
+    max_jobs = body.get("max_jobs")
+    if max_jobs is not None:
+        max_jobs = _integer(max_jobs, "execution_selection max_jobs")
+        if max_jobs <= 0:
+            raise ValueError("execution_selection max_jobs must be positive")
+    selected = list(jobs)
+    if replicate_indices is not None:
+        selected = [
+            row
+            for row in selected
+            if row.get("replicate_index") in set(replicate_indices)
+        ]
+    after_replicate_filter = len(selected)
+    if max_jobs is not None:
+        selected = selected[:max_jobs]
+    selected_ids = [str(row["job_id"]) for row in selected]
+    expected = {
+        "schema_version": EXECUTION_SELECTION_SCHEMA_VERSION,
+        "selection_order": "canonical_workload_order",
+        "operation_order": ["replicate_filter", "max_jobs_prefix"],
+        "replicate_indices": replicate_indices,
+        "max_jobs": max_jobs,
+        "source_instances": len(jobs),
+        "instances_after_replicate_filter": after_replicate_filter,
+        "selected_instances": len(selected),
+        "selected_family_counts": dict(
+            Counter(str(row["constraint"]) for row in selected)
+        ),
+        "selected_job_ids": selected_ids,
+        "selected_job_ids_sha256": sha256_value(selected_ids),
+    }
+    if body != expected:
+        raise ValueError("workload execution_selection differs from its jobs")
+    if not selected:
+        raise ValueError("workload execution_selection contains no jobs")
+    return selected
 
 
 def _validate_tokenizer_fingerprint(
@@ -119,7 +201,7 @@ def require_tokenizer_compatibility(
 def validate_compiled_constraint_artifact(
     artifact: Mapping[str, Any],
 ) -> None:
-    """Validate an authenticated schema-v1 token-partition NFA."""
+    """Validate an authenticated schema-v2 token-partition NFA."""
 
     if not isinstance(artifact, Mapping):
         raise ValueError("compiled_constraint must be an object")
@@ -179,8 +261,8 @@ def validate_compiled_constraint_artifact(
 
     n_low = _integer(body.get("n_low"), "compiled constraint n_low")
     n = _integer(body.get("n"), "compiled constraint n")
-    if not 0 <= n_low <= n:
-        raise ValueError("compiled constraint length bounds are invalid")
+    if body.get("length_contract") != terminal_eos_length_contract(n_low, n):
+        raise ValueError("compiled constraint terminal-EOS length contract differs")
     _integer_list(
         body.get("prompt_token_ids"),
         "compiled constraint prompt_token_ids",
@@ -325,6 +407,23 @@ def load_workload(
         )
     if raw.get("jobs_sha256") != sha256_value(jobs):
         raise ValueError("workload jobs_sha256 mismatch")
+    bounds = {
+        (int(row["n_low"]), int(row["n"]))
+        for row in jobs
+        if isinstance(row, Mapping)
+        and isinstance(row.get("n_low"), int)
+        and not isinstance(row.get("n_low"), bool)
+        and isinstance(row.get("n"), int)
+        and not isinstance(row.get("n"), bool)
+    }
+    if len(bounds) != 1:
+        raise ValueError("workload jobs do not share one length interval")
+    n_low, n = next(iter(bounds))
+    if (
+        raw.get("length_interval_including_eos") != [n_low, n]
+        or raw.get("length_contract") != terminal_eos_length_contract(n_low, n)
+    ):
+        raise ValueError("workload terminal-EOS length contract differs")
 
     seen_ids: set[str] = set()
     seen_indices: set[int] = set()
@@ -350,6 +449,7 @@ def load_workload(
     counts = dict(Counter(str(row["constraint"]) for row in jobs))
     if raw.get("family_counts") != counts:
         raise ValueError("workload family_counts disagrees with jobs")
+    raw["_execution_jobs"] = _execution_rows(raw, jobs)
     raw["_family_order"] = family_order(jobs)
     raw["_workload_path"] = str(path)
     raw["_workload_file_sha256"] = sha256_file(path)
@@ -443,21 +543,13 @@ def compose_user_content(
 ) -> str:
     """Combine the dataset task and compiled instruction in one user turn."""
 
+    task_prompt_text = row.get("task_prompt_text")
+    if not isinstance(task_prompt_text, str) or not task_prompt_text:
+        raise ValueError("task_prompt_text must be a non-empty string")
     prompt_text = row.get("prompt_text")
-    if not isinstance(prompt_text, str):
-        raise ValueError("prompt_text must be a string")
-    base_task = (
-        prompt_text
-        if prompt_text
-        else "Write one short, coherent English sentence or passage."
-    )
-    return "\n\n".join(
-        (
-            base_task,
-            render_constraint_instruction(row, tokenizer),
-            "Return only the requested generated text. Do not explain the constraint.",
-        )
-    )
+    if prompt_text != task_prompt_text:
+        raise ValueError("prompt_text must equal the authenticated task_prompt_text")
+    return task_prompt_text + "\n\n" + render_constraint_instruction(row, tokenizer)
 
 
 def render_prompt_ids(tokenizer: Any, row: Mapping[str, Any]) -> List[int]:
@@ -658,5 +750,6 @@ __all__ = [
     "require_tokenizer_compatibility",
     "sha256_file",
     "sha256_value",
+    "terminal_eos_length_contract",
     "validate_compiled_constraint_artifact",
 ]
