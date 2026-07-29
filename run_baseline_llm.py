@@ -21,7 +21,12 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 import torch
 import transformers
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GenerationConfig,
+)
 
 from constraint_baseline import (
     compose_user_content,
@@ -40,7 +45,7 @@ from constraint_baseline import (
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = Path("/project/aip-ksmeel/sunjia72/models/Qwen3.5-2B")
 BASELINE_METHOD = "baseline_llm"
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_KIND = "baseline_llm_results"
 
@@ -249,6 +254,8 @@ def _sample_key(row: Mapping[str, Any]) -> tuple[str, str, int]:
 
 
 def _sample_seed(base_seed: int, row: Mapping[str, Any], sample_index: int) -> int:
+    if sample_index == 0:
+        return int(row["seed"])
     return (
         int(base_seed) + int(row["seed"]) * 1009 + int(sample_index)
     ) % (2**31 - 1)
@@ -396,19 +403,22 @@ def _load_scoring_contract(
         model_path,
         local_files_only=local_files_only,
     )
-    configured_terminals = getattr(config, "eos_token_id", None)
-    if configured_terminals is None:
-        terminal_ids = [int(tokenizer.eos_token_id)]
-        terminal_source = "tokenizer.eos_token_id"
-    else:
-        terminal_ids = (
-            [int(configured_terminals)]
-            if isinstance(configured_terminals, int)
-            else [int(token_id) for token_id in configured_terminals]
+    try:
+        generation_config = GenerationConfig.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
         )
-        terminal_ids.insert(0, int(tokenizer.eos_token_id))
-        terminal_ids = list(dict.fromkeys(terminal_ids))
-        terminal_source = "tokenizer EOS plus top-level model config eos_token_id"
+    except OSError:
+        generation_config = GenerationConfig.from_model_config(config)
+    terminal_ids = _configured_terminal_token_ids(
+        tokenizer,
+        config,
+        generation_config,
+    )
+    terminal_source = (
+        "canonical tokenizer EOS plus tokenizer, model-config, nested "
+        "text-config, and generation-config terminal aliases"
+    )
     special_ids = {
         int(token_id) for token_id in getattr(tokenizer, "all_special_ids", ())
     }
@@ -443,6 +453,39 @@ def _load_scoring_contract(
     }
     contract["contract_sha256"] = sha256_value(contract)
     return tokenizer, contract
+
+
+def _configured_terminal_token_ids(
+    tokenizer: Any,
+    config: Any,
+    generation_config: Any,
+) -> List[int]:
+    """Collect the same model-native STOP aliases used by constrained decoding."""
+
+    if tokenizer.eos_token_id is None:
+        raise ValueError("target tokenizer must define EOS")
+    terminal_ids = [int(tokenizer.eos_token_id)]
+    sources = (
+        getattr(tokenizer, "eos_token_ids", None),
+        getattr(config, "eos_token_id", None),
+        getattr(getattr(config, "text_config", None), "eos_token_id", None),
+        getattr(generation_config, "eos_token_id", None),
+    )
+    for source in sources:
+        if source is None:
+            continue
+        values = source if isinstance(source, (list, tuple, set)) else (source,)
+        for value in values:
+            if isinstance(value, bool):
+                raise ValueError("terminal token IDs cannot be booleans")
+            token_id = int(value)
+            if token_id < 0 or token_id >= len(tokenizer):
+                raise ValueError(
+                    f"configured terminal token_id={token_id} is outside the "
+                    "tokenizer vocabulary"
+                )
+            terminal_ids.append(token_id)
+    return list(dict.fromkeys(terminal_ids))
 
 
 def _prepare_scoring_rows(
@@ -514,6 +557,21 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _apply_terminal_boundary_probe(
+    raw_ids: Sequence[int],
+    terminal_ids: Sequence[int],
+    max_total_tokens: int,
+) -> tuple[List[int], int | None]:
+    generated = [int(token_id) for token_id in raw_ids]
+    terminals = {int(token_id) for token_id in terminal_ids}
+    if (
+        len(generated) == int(max_total_tokens)
+        and generated[-1] not in terminals
+    ):
+        return generated[:-1], generated[-1]
+    return generated, None
+
+
 def _generate(
     model: Any,
     tokenizer: Any,
@@ -553,10 +611,19 @@ def _generate(
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     runtime_s = time.perf_counter() - started
-    new_ids = [
+    raw_new_ids = [
         int(token)
         for token in output[0, input_ids.shape[1] :].detach().cpu().tolist()
     ]
+    max_total_tokens = int(row["n"])
+    # The final generation step is an EOS probe: the content contract has room
+    # for at most n-1 tokens. Preserve a terminal sampled at step n, but do not
+    # turn a nonterminal probe into a 65th content token.
+    new_ids, discarded_probe_token_id = _apply_terminal_boundary_probe(
+        raw_new_ids,
+        terminal_ids,
+        max_total_tokens,
+    )
     evaluation = evaluate_generated_ids(
         row,
         new_ids,
@@ -564,11 +631,25 @@ def _generate(
         terminal_token_ids=terminal_ids,
     )
     content_ids = evaluation["content_token_ids"]
+    hit_content_token_cap = len(content_ids) == max_total_tokens - 1
     return {
         "prompt_token_count": len(prompt_ids),
         "prompt_token_ids_sha256": sha256_value(prompt_ids),
         "new_token_ids": new_ids,
+        "generated_token_ids": new_ids,
+        "raw_generated_token_count": len(raw_new_ids),
+        "discarded_nonterminal_probe": discarded_probe_token_id is not None,
+        "discarded_probe_token_id": discarded_probe_token_id,
         "generated_text": _decode(tokenizer, content_ids),
+        "generated_total_len": evaluation["generated_total_token_count"],
+        "generated_content_len": evaluation["generated_content_token_count"],
+        "generated_content_token_ids": content_ids,
+        "terminal_eos_token_id": evaluation["actual_terminal_token_id"],
+        "terminal_eos_count": int(evaluation["terminal_eos_ok"]),
+        "terminated_with_eos": evaluation["terminal_eos_ok"],
+        "hit_content_token_cap": hit_content_token_cap,
+        "valid_generation": evaluation["strict_accepts"],
+        "keyword_occurrence_counts": evaluation["occurrence_counts"],
         "generation_runtime_s": runtime_s,
         "cuda_peak_allocated_gib": (
             torch.cuda.max_memory_allocated(device) / (1024**3)
@@ -869,6 +950,10 @@ def _write_csv(path: Path, samples: Sequence[Mapping[str, Any]]) -> None:
         "raw_token_budget_ok",
         "generated_total_token_count",
         "generated_content_token_count",
+        "generated_total_len",
+        "generated_content_len",
+        "hit_content_token_cap",
+        "valid_generation",
         "precompute_runtime_s",
         "generation_runtime_s",
         "cuda_peak_allocated_gib",
@@ -953,8 +1038,58 @@ def _validate_sample_record(
         raise ValueError(f"sample {expected_key} has mismatched seed")
     if not isinstance(record.get("new_token_ids"), list):
         raise ValueError(f"sample {expected_key} has no generated token list")
-    if not isinstance(record.get("evaluation"), dict):
+    evaluation = record.get("evaluation")
+    if not isinstance(evaluation, dict):
         raise ValueError(f"sample {expected_key} has no evaluation object")
+    canonical_expectations = {
+        "generated_token_ids": record["new_token_ids"],
+        "generated_content_token_ids": evaluation.get("content_token_ids"),
+        "generated_total_len": evaluation.get("generated_total_token_count"),
+        "generated_content_len": evaluation.get(
+            "generated_content_token_count"
+        ),
+        "terminal_eos_token_id": evaluation.get("actual_terminal_token_id"),
+        "terminal_eos_count": int(
+            evaluation.get("terminal_eos_ok") is True
+        ),
+        "terminated_with_eos": evaluation.get("terminal_eos_ok"),
+        "valid_generation": evaluation.get("strict_accepts"),
+        "keyword_occurrence_counts": evaluation.get("occurrence_counts"),
+        "hit_content_token_cap": (
+            evaluation.get("generated_content_token_count")
+            == int(row["n"]) - 1
+        ),
+    }
+    changed = {
+        field: (record.get(field), expected)
+        for field, expected in canonical_expectations.items()
+        if record.get(field) != expected
+    }
+    if changed:
+        raise ValueError(
+            f"sample {expected_key} has inconsistent canonical fields: "
+            f"{changed}"
+        )
+    discarded = record.get("discarded_nonterminal_probe")
+    raw_count = record.get("raw_generated_token_count")
+    if (
+        not isinstance(discarded, bool)
+        or isinstance(raw_count, bool)
+        or not isinstance(raw_count, int)
+        or raw_count
+        != len(record["new_token_ids"]) + int(discarded)
+        or (
+            discarded
+            and record.get("discarded_probe_token_id") is None
+        )
+        or (
+            not discarded
+            and record.get("discarded_probe_token_id") is not None
+        )
+    ):
+        raise ValueError(
+            f"sample {expected_key} has invalid terminal boundary probe fields"
+        )
     if require_execution:
         execution = record.get("execution")
         if not isinstance(execution, dict):
@@ -1075,7 +1210,7 @@ def _slurm_command(
         f"--output={worker_dir / 'stdout.log'}",
         f"--error={worker_dir / 'stderr.log'}",
         f"--chdir={ROOT}",
-        "env",
+        "/usr/bin/env",
         f"CUDA_VISIBLE_DEVICES={slot['physical_gpu_id']}",
         f"OMP_NUM_THREADS={cpus_per_worker}",
         f"MKL_NUM_THREADS={cpus_per_worker}",

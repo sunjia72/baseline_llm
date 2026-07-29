@@ -31,12 +31,15 @@ from run_baseline_llm import (
     MANIFEST_KIND,
     RESULT_SCHEMA_VERSION,
     _balanced_assignments,
+    _apply_terminal_boundary_probe,
     _collect_samples,
+    _configured_terminal_token_ids,
     _finalize_results,
     _model_slug,
     _parse_gpu_ids,
     _planned_tasks,
     _prepare_scoring_rows,
+    _sample_seed,
     _slurm_command,
     _worker_slots,
     select_jobs,
@@ -241,6 +244,52 @@ def test_multiple_model_native_terminal_ids() -> None:
     )
     assert not midstream["terminal_eos_ok"]
     assert not midstream["strict_accepts"]
+
+
+def test_configured_terminal_ids_include_all_model_native_aliases() -> None:
+    config = SimpleNamespace(
+        eos_token_id=[99, 101],
+        text_config=SimpleNamespace(eos_token_id=102),
+    )
+    generation_config = SimpleNamespace(eos_token_id=[99, 103])
+
+    class SizedTokenizer(FakeTokenizer):
+        eos_token_ids = [99, 100]
+
+        def __len__(self) -> int:
+            return 128
+
+    assert _configured_terminal_token_ids(
+        SizedTokenizer(),
+        config,
+        generation_config,
+    ) == [99, 100, 101, 102, 103]
+
+
+def test_first_sample_uses_authenticated_job_seed() -> None:
+    example = row()
+    example["seed"] = 123456
+
+    assert _sample_seed(999, example, 0) == 123456
+    assert _sample_seed(999, example, 1) != 123456
+
+
+def test_terminal_boundary_probe_preserves_eos_and_discards_nonterminal() -> None:
+    terminal, discarded = _apply_terminal_boundary_probe(
+        [1, 2, 99],
+        [99, 100],
+        3,
+    )
+    assert terminal == [1, 2, 99]
+    assert discarded is None
+
+    capped, discarded = _apply_terminal_boundary_probe(
+        [1, 2, 3],
+        [99, 100],
+        3,
+    )
+    assert capped == [1, 2]
+    assert discarded == 3
 
 
 @pytest.mark.parametrize(
@@ -584,6 +633,7 @@ def test_slurm_worker_masks_physical_gpu_but_uses_logical_cuda_zero(
     assert "--exact" in command
     assert "--exclusive" not in command
     assert "--nodelist=node-b" in command
+    assert "/usr/bin/env" in command
     assert "CUDA_VISIBLE_DEVICES=2" in command
     assert "OMP_NUM_THREADS=8" in command
 
@@ -610,12 +660,30 @@ def _distributed_record(task: Dict[str, Any], run_signature: str) -> Dict[str, A
         "sample_index": task["sample_index"],
         "sample_seed": task["sample_seed"],
         "new_token_ids": [1, 99],
+        "generated_token_ids": [1, 99],
+        "generated_content_token_ids": [1],
+        "generated_total_len": 2,
+        "generated_content_len": 1,
+        "terminal_eos_token_id": 99,
+        "terminal_eos_count": 1,
+        "terminated_with_eos": True,
+        "hit_content_token_cap": False,
+        "valid_generation": True,
+        "keyword_occurrence_counts": [1],
+        "raw_generated_token_count": 2,
+        "discarded_nonterminal_probe": False,
+        "discarded_probe_token_id": None,
         "evaluation": {
             "strict_accepts": True,
             "semantic_constraint_accepts": True,
             "terminal_eos_ok": True,
             "length_ok": True,
             "raw_token_budget_ok": True,
+            "actual_terminal_token_id": 99,
+            "generated_total_token_count": 2,
+            "generated_content_token_count": 1,
+            "content_token_ids": [1],
+            "occurrence_counts": [1],
         },
         "generation_runtime_s": 0.1,
         "execution": {
