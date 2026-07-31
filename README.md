@@ -8,7 +8,7 @@ no logit mask, guided decoding, rejection sampling, or witness.
 ## Boundary with the benchmark compiler
 
 The baseline is a consumer, not a constraint compiler. It accepts only current
-`compiled_keyword_dataset` workload schema v3 files whose jobs embed
+`compiled_keyword_dataset` workload schema v4 files whose jobs embed
 `compiled_token_partition_nfa` schema v1 artifacts. Each artifact contains:
 
 - the compact NFA transitions and wildcard transitions;
@@ -52,7 +52,7 @@ dispatch on constraint-family names.
 
 Workload paths are intentionally required. Historical schema-v1 result
 workloads do not embed authenticated compiled artifacts and are rejected with
-a migration error. Use schema-v3 CommonGen and CoAuthor workloads produced by
+a migration error. Use schema-v4 CommonGen and CoAuthor workloads produced by
 the current NFA benchmark preparation step.
 
 For the default balanced smoke run (one midpoint job per family and dataset):
@@ -60,11 +60,12 @@ For the default balanced smoke run (one midpoint job per family and dataset):
 ```bash
 cd /project/aip-ksmeel/sunjia72/constraint_decoding/baseline_llm
 conda activate nfa
+NFA=/project/aip-ksmeel/sunjia72/constraint_decoding/nfa_fpras
 
 python run_baseline_llm.py \
   --dataset both \
-  --common_gen_workload /path/to/common_gen_compiled_v3/workload.json \
-  --coauthor_workload /path/to/coauthor_compiled_v3/workload.json \
+  --common_gen_workload "$NFA/experiment/results_nfa_updated_hmm_full500_20260728/qwen_common_gen/workload.json" \
+  --coauthor_workload "$NFA/experiment/results_nfa_updated_hmm_full500_20260728/qwen_coauthor/workload.json" \
   --selection midpoint_per_family
 ```
 
@@ -73,7 +74,7 @@ To validate inputs and save rendered instructions without loading the model:
 ```bash
 python run_baseline_llm.py \
   --dataset common_gen \
-  --common_gen_workload /path/to/common_gen_compiled_v3/workload.json \
+  --common_gen_workload /path/to/common_gen_compiled_v4/workload.json \
   --dry_run
 ```
 
@@ -82,8 +83,8 @@ For all jobs with stochastic decoding:
 ```bash
 python run_baseline_llm.py \
   --dataset both \
-  --common_gen_workload /path/to/common_gen_compiled_v3/workload.json \
-  --coauthor_workload /path/to/coauthor_compiled_v3/workload.json \
+  --common_gen_workload /path/to/common_gen_compiled_v4/workload.json \
+  --coauthor_workload /path/to/coauthor_compiled_v4/workload.json \
   --selection all \
   --samples_per_job 3 \
   --generation_mode sample \
@@ -97,20 +98,20 @@ An existing Slurm allocation can run one persistent worker per node/GPU pair:
 ```bash
 python -u run_baseline_llm.py \
   --dataset both \
-  --common_gen_workload /path/to/common_gen_compiled_v3/workload.json \
-  --coauthor_workload /path/to/coauthor_compiled_v3/workload.json \
+  --common_gen_workload /path/to/common_gen_compiled_v4/workload.json \
+  --coauthor_workload /path/to/coauthor_compiled_v4/workload.json \
   --selection all \
   --slurm_nodes allocation \
   --slurm_gpus 0,1,2,3 \
   --cpus_per_worker 8 \
-  --output_dir results/qwen35_all_compiled_v3
+  --output_dir results/qwen35_all_compiled_v4
 ```
 
 Canonical completed-run outputs are:
 
 - `manifest.json`: run identity, completion status, workload references, and
   SHA-256 identities for the result artifacts;
-- `results.jsonl`: one schema-v1 record per successful model invocation;
+- `results.jsonl`: one schema-v2 record per successful model invocation;
 - `results.csv`: the compact tabular form of those records;
 - `summary.json`: aggregate, per-dataset, and per-constraint statistics; and
 - `config.json`: the authenticated run plan and provenance.

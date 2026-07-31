@@ -60,12 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--common_gen_workload",
         type=Path,
-        help="Required for CommonGen: compiled_keyword_dataset schema v3 JSON.",
+        help="Required for CommonGen: compiled_keyword_dataset schema v4 JSON.",
     )
     parser.add_argument(
         "--coauthor_workload",
         type=Path,
-        help="Required for CoAuthor: compiled_keyword_dataset schema v3 JSON.",
+        help="Required for CoAuthor: compiled_keyword_dataset schema v4 JSON.",
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument(
@@ -1497,7 +1497,7 @@ def main() -> None:
     ]
     if missing_workloads:
         raise ValueError(
-            "current schema-v3 compiled workloads are required: "
+            "current schema-v4 compiled workloads are required: "
             + ", ".join(missing_workloads)
         )
     workloads = {

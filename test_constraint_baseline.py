@@ -782,5 +782,5 @@ def test_finalization_emits_canonical_results_manifest_and_legacy_aliases(
 
 def test_missing_workload_message_names_current_schema() -> None:
     source = Path(baseline_runner.__file__).read_text(encoding="utf-8")
-    assert "current schema-v3 compiled workloads are required" in source
-    assert "current schema-v2 compiled workloads are required" not in source
+    assert "current schema-v4 compiled workloads are required" in source
+    assert "current schema-v3 compiled workloads are required" not in source
